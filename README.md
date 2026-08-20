@@ -1,2 +1,113 @@
-# Reconstrucci-n-de-Campos-de-Flujo-con-Super-Resoluci-n-mediante-CNNs-con-F-sica-Incorporada
-Desarrollo de un pipeline de super-resolución basado en CNN para reconstruir campos de flujo 2D de alta resolución (estela de cilindro, Re≈1600) a partir de datos CFD de baja resolución, logrando una reducción del 90.3% en el error frente al baseline de interpolación bicúbica (PhiFlow, PyTorch).
+# Flow Field Super-Resolution with Physics-Informed CNNs
+
+Reconstructing high-resolution 2D flow fields from sparse/low-resolution CFD data using a residual CNN, with an optional physics-informed divergence penalty for incompressible flow.
+
+**Case study:** cylinder wake at Re=100 (2D Kármán vortex street) — the standard benchmark used in the foundational literature on this problem (Fukami, Fukagata & Taira, 2019).
+
+---
+
+## Motivation
+
+High-fidelity CFD (fine mesh, DNS/LES) is expensive. This project explores whether a CNN can learn to reconstruct a high-resolution flow field from a coarse, cheap simulation (or from sparse sensor-like measurements) — a task directly analogous to image super-resolution, but applied to a physical field instead of pixels. This has practical relevance for real-time flow monitoring (e.g. wind turbine wakes, HVAC systems) where running full CFD live isn't feasible.
+
+## Key results
+
+| Model | Relative L2 error ↓ | Divergence² (mean) ↓ |
+|---|---|---|
+| Bicubic interpolation (baseline) | 0.2202 | — |
+| CNN (MSE only) | **0.0213** | 6.0 × 10⁻⁶ |
+| CNN + physics-informed divergence loss | 0.0217 | **5.0 × 10⁻⁶** |
+| *Ground truth (reference floor)* | *0.0000* | *4.2 × 10⁻⁶* |
+
+- The CNN improves reconstruction accuracy by **90.3%** over naive bicubic upsampling.
+- The ground truth itself has non-zero divergence (4.2 × 10⁻⁶) due to finite-difference discretization error — this sets a practical floor, not zero, for what "physically consistent" means on this grid.
+- The MSE-only model already lands close to that floor, suggesting the network implicitly learns near-incompressible solutions purely from data. The explicit physics term pushes it marginally closer to the floor **without sacrificing accuracy** (L2 error unchanged within noise).
+
+### Generalization to an unseen Reynolds number
+
+Both models were evaluated zero-shot (no retraining) on a flow generated at Re ≈ 2286 — a ~43% increase from the training Reynolds (Re ≈ 1600), obtained by lowering the kinematic viscosity in the PhiFlow simulation. Normalization statistics from the original training set were reused, to expose any distribution shift rather than mask it.
+
+| Model | L2 error @ Re=1600 (train) | L2 error @ Re=2286 (unseen) | Δ |
+|---|---|---|---|
+| MSE only | 0.0217 | **0.0168** | −22.5% |
+| Physics-informed | 0.0217 | **0.0185** | −14.9% |
+
+Both models generalize well — error *decreases* rather than degrading, indicating the network learned transferable structure of the vortex-shedding pattern rather than memorizing the specific training regime. Interestingly, the MSE-only model slightly outperforms the physics-informed one at the unseen Reynolds, suggesting the divergence penalty's weight (`λ`) may be implicitly tuned to the statistics of the training Reynolds rather than being universally optimal.
+
+*(Insert vorticity comparison image here — Re=1600 vs. Re=2286 reconstruction)*
+
+### Deployment on modest hardware (no dedicated GPU)
+
+Most flow super-resolution literature assumes unrestricted research-grade GPU access. Since the model here is small (67,330 parameters), it was benchmarked across 4 inference configurations to evaluate viability on typical engineering hardware (laptops with integrated graphics, 8GB RAM):
+
+| Configuration | Latency/frame (ms) | Model size (MB) | Relative L2 error |
+|---|---|---|---|
+| PyTorch — GPU (T4, reference) | 1.54 | 0.262 | 0.0217 |
+| PyTorch — CPU | 18.00 | 0.262 | 0.0217 |
+| **ONNX Runtime — CPU** | **13.13** | **0.014** | 0.0217 |
+| ONNX Runtime — CPU, INT8 quantized | 25.24 | 0.077 | 0.0222 |
+
+- **ONNX Runtime on CPU delivers near real-time inference (13 ms/frame, close to the 16.7 ms / 60 FPS threshold) with zero accuracy loss**, on hardware with no dedicated GPU — confirming the model is practically deployable outside a research environment.
+- **Counter-intuitive finding: INT8 dynamic quantization made inference *slower*, larger, and slightly less accurate.** For a model this small, the overhead of the quantize/dequantize operations per layer outweighs any theoretical benefit of 8-bit arithmetic — quantization tends to pay off for larger models with wider layers, not for compact CNNs like this one. This is reported as a genuine (if negative) empirical result rather than omitted, since it's informative for anyone considering the same optimization on similarly small architectures.
+
+*(Insert Pareto trade-off plot here — accuracy vs. latency across the 4 configurations)*
+
+*(Insert divergence field comparison image here — MSE-only vs. MSE+physics vs. ground truth)*
+
+## Method
+
+### 1. Dataset generation
+2D incompressible Navier-Stokes flow around a cylinder, simulated with [ΦFlow (PhiFlow)](https://github.com/tum-pbs/PhiFlow). High-resolution snapshots (128×64) are captured after the flow reaches a periodic vortex-shedding regime; low-resolution pairs are generated by 4× spatial downsampling to simulate sparse sensing / coarse-mesh data.
+
+### 2. Super-resolution CNN
+Pre-upsampling residual architecture (SRCNN-style): the low-resolution input is first upsampled to target resolution via bicubic interpolation, then a 5-layer CNN learns to predict a residual correction on top of it, rather than the absolute field. Trained with MSE loss, Adam optimizer, temporal (non-shuffled) train/val/test split to avoid leakage between near-identical consecutive frames.
+
+### 3. Physics-informed extension
+A divergence penalty term (`L = L_MSE + λ·L_div`, with `L_div = mean[(∂u/∂x + ∂v/∂y)²]`) is added to softly enforce the incompressibility constraint of 2D flow, computed via finite differences on the denormalized reconstructed field.
+
+### 4. Reynolds generalization test
+The trained models (frozen, no retraining) are evaluated on a newly generated dataset at a different Reynolds number, using the original training-set normalization statistics, to test whether the learned representation transfers beyond the training regime.
+
+### 5. Deployment efficiency benchmark
+The trained model is exported to ONNX and benchmarked across PyTorch-GPU, PyTorch-CPU, ONNX-CPU, and INT8-quantized ONNX-CPU configurations, measuring per-frame latency, memory footprint, model size, and any accuracy trade-off — to characterize real-world deployability on hardware without a dedicated GPU.
+
+## Repository structure
+
+```
+├── notebooks/
+│   ├── 01_dataset_generation.ipynb          # PhiFlow simulation + low/high-res pairs
+│   ├── 02_cnn_training.ipynb                # SRCNN-style training, MSE-only
+│   ├── 03_physics_informed_loss.ipynb       # Divergence penalty extension
+│   ├── 04_reynolds_generalization.ipynb     # Zero-shot evaluation at unseen Re
+│   └── 05_efficiency_benchmark.ipynb        # CPU/ONNX/quantization deployment benchmark
+├── models/
+│   ├── srcnn_cylinder_wake.pt
+│   ├── srcnn_physics_cylinder_wake.pt
+│   ├── srcnn_model.onnx
+│   └── srcnn_model_quantized.onnx
+├── figures/
+│   └── (comparison plots exported from the notebooks)
+└── README.md
+```
+
+## Running this project
+
+All notebooks are designed for Google Colab (free T4 GPU tier). Each notebook mounts Google Drive to persist datasets and model checkpoints across sessions.
+
+1. Run `01_dataset_generation.ipynb` to generate the cylinder wake dataset.
+2. Run `02_cnn_training.ipynb` to train the baseline super-resolution CNN.
+3. Run `03_physics_informed_loss.ipynb` to train the physics-informed variant and compare against the baseline.
+4. Run `04_reynolds_generalization.ipynb` to evaluate both trained models on an unseen Reynolds number.
+5. Run `05_efficiency_benchmark.ipynb` to benchmark CPU/ONNX/quantized deployment configurations.
+
+## Future work
+
+- **GAN comparison**: adversarial training to assess whether it better recovers small-scale turbulent structures at the cost of physical consistency guarantees.
+- **Multi-Reynolds training**: train on a range of Re simultaneously to see if it closes the gap between the MSE-only and physics-informed models observed at the unseen Reynolds.
+- Extend generalization testing to a wider range of Reynolds numbers (both higher and lower than the training regime) to map out the model's valid operating range.
+- **Static quantization with calibration** (instead of dynamic) to check whether it avoids the overhead penalty observed with dynamic INT8 quantization on this compact architecture.
+
+## Reference
+
+Fukami, K., Fukagata, K., & Taira, K. (2019). Super-resolution reconstruction of turbulent flows with machine learning. *Journal of Fluid Mechanics*, 870, 106-120.
+
